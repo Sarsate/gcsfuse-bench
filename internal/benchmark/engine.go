@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/googlecloudplatform/gcsfuse/v3/cfg"
+	"github.com/googlecloudplatform/gcsfuse/v3/internal/cache/lru"
 	"github.com/googlecloudplatform/gcsfuse/v3/internal/logger"
 	"github.com/googlecloudplatform/gcsfuse/v3/internal/storage/gcs"
 )
@@ -70,6 +71,10 @@ type Engine struct {
 	// exceeds poolSlotSizeCap).
 	writePool WritePool
 
+	// mrdCache is a cache of MultiRangeDownloader instances for read tracks
+	// that use the "multirange" ReadType. Keyed by object name.
+	mrdCache *lru.Cache
+
 	// readBufPool is a pool of 256 KiB drain buffers reused across doRead
 	// calls. Pooling eliminates per-read heap allocations and the associated
 	// GC pressure, which otherwise inflates p999/pMax latency.
@@ -79,6 +84,16 @@ type Engine struct {
 	// Defaults to os.Stderr when nil is passed to NewEngine.
 	out io.Writer
 }
+
+// mrdCacheEntry wraps a gcs.MultiRangeDownloader for storage in the Engine's
+// LRU cache.
+type mrdCacheEntry struct {
+	mrd gcs.MultiRangeDownloader
+}
+
+// Size returns the size of the entry for LRU accounting. All MRDs are treated
+// as unit size.
+func (e *mrdCacheEntry) Size() uint64 { return 1 }
 
 // trackState holds mutable per-track counters and histograms.
 type trackState struct {
@@ -135,6 +150,7 @@ func NewEngine(bucket gcs.Bucket, bCfg cfg.BenchmarkConfig, verbosity int, out i
 		trackState:   states,
 		writeEntropy: entropy,
 		out:          out,
+		mrdCache:     lru.NewCache(2048), // Cache up to 2048 object connections
 	}
 
 	// Build write pool if any track writes fixed-size (or bounded) objects
@@ -654,6 +670,9 @@ func (e *Engine) pickObjectFromState(rng *rand.Rand, ts *trackState) string {
 // When ReadSize <= 0, the entire object is read (no Range restriction).
 // When ReadSize > 0, a range-read of exactly ReadSize bytes is performed.
 func (e *Engine) doRead(ctx context.Context, ts *trackState, objectName string) error {
+	if strings.ToLower(ts.cfg.ReadType) == "multirange" {
+		return e.doReadMultiRange(ctx, ts, objectName)
+	}
 	readSize := ts.cfg.ReadSize
 
 	req := &gcs.ReadObjectRequest{
@@ -721,6 +740,122 @@ func (e *Engine) doRead(ctx context.Context, ts *trackState, objectName string) 
 		objectName, bytesRead, total.Round(time.Millisecond),
 		float64(bytesRead)/total.Seconds()/float64(1<<20))
 	return nil
+}
+
+// doReadMultiRange issues a GCS read using MultiRangeDownloader to amortize
+// connection setup costs. Connection state is maintained in the Engine's
+// mrdCache.
+func (e *Engine) doReadMultiRange(ctx context.Context, ts *trackState, objectName string) error {
+	var mrd gcs.MultiRangeDownloader
+
+	// 1. Retrieve or create the MultiRangeDownloader (MRD) connection.
+	if entry := e.mrdCache.LookUp(objectName); entry != nil {
+		mrd = entry.(*mrdCacheEntry).mrd
+	} else {
+		// New connection needed.
+		req := &gcs.MultiRangeDownloaderRequest{
+			Name: objectName,
+		}
+		var err error
+		mrd, err = e.bucket.NewMultiRangeDownloader(ctx, req)
+		if err != nil {
+			return fmt.Errorf("NewMultiRangeDownloader: %w", err)
+		}
+		// Insert into cache; close any evicted MRDs to prevent connection leaks.
+		evicted, _ := e.mrdCache.Insert(objectName, &mrdCacheEntry{mrd: mrd})
+		for _, v := range evicted {
+			v.(*mrdCacheEntry).mrd.Close()
+		}
+	}
+
+	// 2. Determine the length for THIS individual request.
+	// ts.cfg.ReadSize 0 means "until EOF" in BidiRead API.
+	length := ts.cfg.ReadSize
+
+	// 3. Issue the range read.
+	bufPtr := e.readBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer e.readBufPool.Put(bufPtr)
+
+	type res struct {
+		bytes int64
+		err   error
+	}
+	done := make(chan res, 1)
+	start := time.Now()
+
+	// Capture TTFB on the first 256 KiB.
+	instrumentedOutput := &ttfbWriter{
+		wrapped:   &drainWriter{buf: buf},
+		start:     start,
+		threshold: 256 * 1024,
+		onFirst: func(d time.Duration) {
+			ts.hists.RecordTTFB(d.Microseconds())
+		},
+	}
+
+	mrd.Add(instrumentedOutput, 0, length, func(offset int64, bytesRead int64, err error) {
+		instrumentedOutput.Finalize()
+		done <- res{bytes: bytesRead, err: err}
+	})
+
+	var finalRes res
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case finalRes = <-done:
+	}
+
+	if finalRes.err == nil {
+		total := time.Since(start)
+		ts.hists.RecordTotal(total.Microseconds())
+		ts.totalBytes.Add(finalRes.bytes)
+		logger.Debugf("[doReadMultiRange] object=%s bytes=%d total=%s throughput=%.1f MiB/s\n",
+			objectName, finalRes.bytes, total.Round(time.Millisecond),
+			float64(finalRes.bytes)/total.Seconds()/float64(1<<20))
+	}
+
+	return finalRes.err
+}
+
+type drainWriter struct {
+	buf []byte
+}
+
+func (w *drainWriter) Write(p []byte) (n int, err error) {
+	// Draining data without copy.
+	return len(p), nil
+}
+
+// ttfbWriter wraps an io.Writer to record the time until a threshold of bytes is reached.
+type ttfbWriter struct {
+	wrapped   io.Writer
+	start     time.Time
+	threshold int64
+	received  int64
+	once      sync.Once
+	onFirst   func(time.Duration)
+}
+
+func (w *ttfbWriter) Write(p []byte) (n int, err error) {
+	n, err = w.wrapped.Write(p)
+	if n > 0 {
+		w.received += int64(n)
+		// If the requested object is smaller than the threshold, record TTFB on EOF (handled by the caller).
+		// Otherwise, record on reaching the threshold.
+		if w.received >= w.threshold {
+			w.once.Do(func() {
+				w.onFirst(time.Since(w.start))
+			})
+		}
+	}
+	return
+}
+
+func (w *ttfbWriter) Finalize() {
+	w.once.Do(func() {
+		w.onFirst(time.Since(w.start))
+	})
 }
 
 // ---------------------------------------------------------------------------

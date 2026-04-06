@@ -49,7 +49,7 @@ benchmark:
   tracks:
     - name: unet3d-read
       op-type: read
-      read-type: new-reader
+      read-type: multirange
       weight: 1
       access-pattern: random   # Each goroutine picks files uniformly at random
 
